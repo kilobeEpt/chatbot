@@ -688,7 +688,8 @@ class ChatBot:
     def __init__(self, session_folder, thread_id=0, headless=False, timeout=10,
                  fast_mode=True, use_antidetect=True, proxy=None, log_callback=None,
                  incognito_mode=False, session_ttl=0, debug_logging=False, selector_monitor=None,
-                 enable_captcha_solving=False, captcha_api_key=None):
+                 enable_captcha_solving=False, captcha_api_key=None,
+                 cloudflare_bypass=False, cloudflare_timeout=30):
         """
         Ининициализация бота
         """
@@ -735,6 +736,18 @@ class ChatBot:
             'solved': 0,
             'failed': 0,
             'skipped': 0
+        }
+        
+        # Cloudflare bypass settings
+        self.cloudflare_bypass = bool(cloudflare_bypass)
+        self.cloudflare_timeout = cloudflare_timeout
+        
+        # Cloudflare statistics
+        self.cloudflare_stats = {
+            'detected': 0,
+            'bypassed': 0,
+            'timeout': 0,
+            'not_detected': 0
         }
 
         self.session_started_at = None
@@ -2380,6 +2393,11 @@ class MailingManager:
         total_captcha_solved = sum(r.get('captcha_stats', {}).get('solved', 0) for r in results)
         total_captcha_failed = sum(r.get('captcha_stats', {}).get('failed', 0) for r in results)
         total_captcha_skipped = sum(r.get('captcha_stats', {}).get('skipped', 0) for r in results)
+        
+        # Aggregate Cloudflare statistics
+        cf_bypassed = len([r for r in results if r.get('cloudflare_status') == 'bypassed'])
+        cf_timeout = len([r for r in results if r.get('cloudflare_status') == 'timeout'])
+        cf_not_detected = len([r for r in results if r.get('cloudflare_status') == 'not_detected'])
 
         # JSON отчет
         report_json = os.path.join(session_folder, 'report.json')
@@ -2394,6 +2412,11 @@ class MailingManager:
                 'failed': total_captcha_failed,
                 'skipped': total_captcha_skipped
             },
+            'cloudflare': {
+                'bypassed': cf_bypassed,
+                'timeout': cf_timeout,
+                'not_detected': cf_not_detected
+            },
             'results': results
         }
 
@@ -2404,7 +2427,7 @@ class MailingManager:
         report_txt = os.path.join(session_folder, 'report.txt')
         with open(report_txt, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("ОТЧЕТ О РАССЫЛКЕ (v2.1 ИСПРАВЛЕННАЯ + CAPTCHA)\n")
+            f.write("ОТЧЕТ О РАССЫЛКЕ (v2.1 ИСПРАВЛЕННАЯ + CAPTCHA + CLOUDFLARE)\n")
             f.write("="*70 + "\n\n")
             f.write(f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Всего сайтов: {summary['total']}\n")
@@ -2423,6 +2446,19 @@ class MailingManager:
             if total_captcha_detected > 0:
                 f.write(f"Успешность решения: {round(total_captcha_solved/total_captcha_detected*100, 1)}%\n")
             f.write("\n")
+            
+            # Cloudflare statistics
+            if cf_bypassed > 0 or cf_timeout > 0:
+                f.write("="*70 + "\n")
+                f.write("CLOUDFLARE СТАТИСТИКА:\n")
+                f.write("="*70 + "\n")
+                f.write(f"Cloudflare обнаружен и обойден: {cf_bypassed}\n")
+                f.write(f"Cloudflare таймаут: {cf_timeout}\n")
+                f.write(f"Без Cloudflare защиты: {cf_not_detected}\n")
+                if cf_bypassed + cf_timeout > 0:
+                    success_rate = round(cf_bypassed / (cf_bypassed + cf_timeout) * 100, 1)
+                    f.write(f"Успешность обхода: {success_rate}%\n")
+                f.write("\n")
 
             f.write("="*70 + "\n")
             f.write("ДЕТАЛИ:\n")
@@ -2436,6 +2472,13 @@ class MailingManager:
                     f.write(f"   Тип чата: {r['chat_type'].upper()}\n")
                 if r.get('error'):
                     f.write(f"   Ошибка: {r['error']}\n")
+                
+                # Cloudflare status per URL
+                cf_status = r.get('cloudflare_status', 'not_detected')
+                if cf_status == 'bypassed':
+                    f.write(f"   🛡️ Cloudflare: Обойден успешно\n")
+                elif cf_status == 'timeout':
+                    f.write(f"   🛡️ Cloudflare: Таймаут ожидания\n")
 
                 # CAPTCHA stats per URL
                 captcha_stats = r.get('captcha_stats')
@@ -2670,6 +2713,29 @@ class ChatBotGUI:
 
         ttk.Label(api_key_frame, text="Get key from: https://2captcha.com/api/user",
                  font=('Arial', 7), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
+
+        # Cloudflare Bypass settings
+        ttk.Separator(col2, orient='horizontal').pack(fill=tk.X, pady=(15, 10))
+
+        ttk.Label(col2, text="🛡️ Cloudflare Bypass", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+
+        self.enable_cloudflare_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(col2, text="🔓 CloudFlare защита (undetected-chromedriver)",
+                       variable=self.enable_cloudflare_var).pack(anchor=tk.W, pady=2)
+
+        # Cloudflare timeout setting
+        cf_timeout_frame = ttk.Frame(col2)
+        cf_timeout_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(cf_timeout_frame, text="Таймаут challenge (сек):", font=('Arial', 9)).pack(side=tk.LEFT)
+
+        self.cloudflare_timeout_var = tk.IntVar(value=30)
+        cf_timeout_spinbox = ttk.Spinbox(cf_timeout_frame, from_=10, to=120,
+                                         textvariable=self.cloudflare_timeout_var, width=8)
+        cf_timeout_spinbox.pack(side=tk.LEFT, padx=(5, 5))
+
+        ttk.Label(cf_timeout_frame, text="(рекомендуется 30-60)",
+                 font=('Arial', 7), foreground='gray').pack(side=tk.LEFT)
 
         # ========== ВКЛАДКА 2: ПРОГРЕСС РАССЫЛКИ ==========
         progress_frame = ttk.Frame(notebook, padding=10)
@@ -3126,6 +3192,9 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
             api_key = self.captcha_api_key_var.get().strip()
             if api_key:
                 self.log_message(f"   API ключ: {api_key[:10]}...{api_key[-5:]}")
+        if self.enable_cloudflare_var.get():
+            self.log_message(f"🛡️ Cloudflare bypass: Включен (undetected-chromedriver)")
+            self.log_message(f"   Таймаут challenge: {self.cloudflare_timeout_var.get()}с")
 
         self.log_message("="*70)
 
@@ -3148,6 +3217,8 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
                 'debug_logging': self.debug_logs_var.get(),
                 'enable_captcha_solving': self.enable_captcha_var.get(),
                 'captcha_api_key': self.captcha_api_key_var.get().strip() if self.enable_captcha_var.get() else None,
+                'cloudflare_bypass': self.enable_cloudflare_var.get(),
+                'cloudflare_timeout': self.cloudflare_timeout_var.get(),
             }
 
             def progress_callback(completed, total):
