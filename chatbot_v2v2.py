@@ -25,12 +25,15 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 
+from chat_selectors import CHAT_SELECTORS as CHAT_SELECTORS_DATASET, CHAT_SELECTORS_META as CHAT_SELECTORS_META_DATASET
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
@@ -683,9 +686,9 @@ class ChatBot:
     
     def __init__(self, session_folder, thread_id=0, headless=False, timeout=10,
                  fast_mode=True, use_antidetect=True, proxy=None, log_callback=None,
-                 incognito_mode=False, session_ttl=0):
+                 incognito_mode=False, session_ttl=0, debug_logging=False, selector_monitor=None):
         """
-        Инициализация бота
+        Ининициализация бота
         """
 
         self.thread_id = thread_id
@@ -703,6 +706,10 @@ class ChatBot:
         self.headless = headless
         self.incognito_mode = bool(incognito_mode)
         self.session_ttl = session_ttl
+        self.debug_logging = bool(debug_logging)
+        self.selector_monitor = selector_monitor or SelectorMonitor(dataset_meta=getattr(self, 'CHAT_SELECTORS_META', {}))
+        self.form_detector = FormDetector(self)
+
         self.session_started_at = None
         self.session_requests = 0
         self.temp_user_data_dir = None
@@ -728,9 +735,9 @@ class ChatBot:
 
         os.makedirs(self.screenshots_folder, exist_ok=True)
 
-        self.setup_logging()
+        self.setup_logging(debug=self.debug_logging)
         self.driver = self._init_driver(headless)
-        self.session_started_at = time.time()
+
         self.session_requests = 0
         self.last_origin = None
         self.clear_browser_state(reason="startup")
@@ -2060,6 +2067,10 @@ class ChatBot:
             self._cleanup_temp_user_data_dir()
 
 
+# Override selector dataset with module-sourced definition
+ChatBot.CHAT_SELECTORS = CHAT_SELECTORS_DATASET
+ChatBot.CHAT_SELECTORS_META = CHAT_SELECTORS_META_DATASET
+
 # ============================================================================
 # МУЛЬТИПОТОЧНАЯ РАССЫЛКА
 # ============================================================================
@@ -2081,7 +2092,8 @@ class MultiThreadMailer:
         self.proxy_manager = proxy_manager
         self.active_threads = {}
         self.stop_event = threading.Event()
-    
+        self.selector_monitor = SelectorMonitor(dataset_meta=CHAT_SELECTORS_META_DATASET)
+
     def run_parallel_mailing(self, urls, message, settings, log_callback=None, progress_callback=None):
         """Параллельная обработка списка URL"""
 
@@ -2257,9 +2269,9 @@ class MailingManager:
             print(f"Ошибка загрузки файла: {e}")
             return []
             
-    def save_report(self, session_folder, results):
+    def save_report(self, session_folder, results, selector_monitor=None):
         """Сохранить отчет о рассылке (JSON + TXT)"""
-        
+
         # JSON отчет
         report_json = os.path.join(session_folder, 'report.json')
         summary = {
@@ -2448,19 +2460,23 @@ class ChatBotGUI:
         self.headless_var = tk.BooleanVar(value=False)
         self.antidetect_var = tk.BooleanVar(value=True)
         self.incognito_var = tk.BooleanVar(value=True)
+        self.debug_logs_var = tk.BooleanVar(value=False)
         self.session_ttl_var = tk.IntVar(value=15)
 
         ttk.Checkbutton(col1, text="⚡ Быстрый режим",
                        variable=self.fast_mode_var).pack(anchor=tk.W, pady=2)
+
         ttk.Checkbutton(col1, text="🔇 Фоновый режим (без GUI браузера)",
                        variable=self.headless_var).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(col1, text="🛡️ Антидетект (рекомендуется)",
                        variable=self.antidetect_var).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(col1, text="🕶️ Инкогнито режим",
                        variable=self.incognito_var).pack(anchor=tk.W, pady=(8, 2))
+        ttk.Checkbutton(col1, text="🐞 Debug логи (подробно)",
+                       variable=self.debug_logs_var).pack(anchor=tk.W, pady=2)
 
         ttl_frame = ttk.Frame(col1)
-        ttl_frame.pack(fill=tk.X, pady=(0, 5))
+
 
         ttk.Label(ttl_frame, text="TTL сессии (мин/URL):").pack(side=tk.LEFT)
         ttl_spinbox = ttk.Spinbox(ttl_frame, from_=0, to=999,
@@ -2954,6 +2970,7 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
                 'fast_mode': self.fast_mode_var.get(),
                 'incognito_mode': self.incognito_var.get(),
                 'session_ttl': self.session_ttl_var.get(),
+                'debug_logging': self.debug_logs_var.get(),
             }
 
             def progress_callback(completed, total):
