@@ -687,7 +687,8 @@ class ChatBot:
     
     def __init__(self, session_folder, thread_id=0, headless=False, timeout=10,
                  fast_mode=True, use_antidetect=True, proxy=None, log_callback=None,
-                 incognito_mode=False, session_ttl=0, debug_logging=False, selector_monitor=None):
+                 incognito_mode=False, session_ttl=0, debug_logging=False, selector_monitor=None,
+                 enable_captcha_solving=False, captcha_api_key=None):
         """
         Ининициализация бота
         """
@@ -710,6 +711,31 @@ class ChatBot:
         self.debug_logging = bool(debug_logging)
         self.selector_monitor = selector_monitor or SelectorMonitor(dataset_meta=getattr(self, 'CHAT_SELECTORS_META', {}))
         self.form_detector = FormDetector(self)
+        
+        # CAPTCHA solving settings
+        self.enable_captcha_solving = bool(enable_captcha_solving)
+        self.captcha_api_key = captcha_api_key
+        self.captcha_solver = None
+        
+        if self.enable_captcha_solving and self.captcha_api_key:
+            try:
+                from captcha_solver import CaptchaSolver
+                self.captcha_solver = CaptchaSolver(self.captcha_api_key, verbose=self.debug_logging)
+                self.log("✓ CAPTCHA solver initialized")
+            except ImportError:
+                self.log("⚠ CaptchaSolver module not found, CAPTCHA solving disabled", "WARNING")
+                self.enable_captcha_solving = False
+            except Exception as e:
+                self.log(f"⚠ Failed to initialize CAPTCHA solver: {e}", "WARNING")
+                self.enable_captcha_solving = False
+        
+        # CAPTCHA statistics
+        self.captcha_stats = {
+            'detected': 0,
+            'solved': 0,
+            'failed': 0,
+            'skipped': 0
+        }
 
         self.session_started_at = None
         self.session_requests = 0
@@ -1868,7 +1894,8 @@ class ChatBot:
             'screenshot': None,
             'error': None,
             'duration': 0,
-            'thread_id': self.thread_id
+            'thread_id': self.thread_id,
+            'captcha_stats': self.captcha_stats.copy()
         }
         
         try:
@@ -1900,7 +1927,11 @@ class ChatBot:
             # Скриншот после открытия чата
             self.take_screenshot(url, 'step2_chat_opened')
             self.log(f"  Контекст после открытия чата: {'iframe' if self.in_iframe_context else 'основной'}", "DEBUG")
-            
+
+            # 2.5. CAPTCHA detection and solving (if enabled)
+            if self.enable_captcha_solving and self.captcha_solver:
+                self._handle_captcha(url)
+
             # 3. Поиск поля ввода (БЕЗ переключения контекста!)
             input_field = self.find_input_field()
             if not input_field:
@@ -2039,7 +2070,76 @@ class ChatBot:
             self.log(f"Время: {result['duration']}с\n")
             
         return result
-             
+    
+    def _handle_captcha(self, page_url):
+        """
+        Detect and solve CAPTCHA if present
+        
+        Args:
+            page_url: URL of the current page
+        """
+        try:
+            if not self.captcha_solver:
+                return
+            
+            # Get page source
+            try:
+                page_source = self.driver.page_source
+            except:
+                self.log("⚠ Failed to get page source for CAPTCHA detection", "WARNING")
+                return
+            
+            # Detect CAPTCHA
+            captcha_info = self.captcha_solver.detect_captcha(page_source, page_url)
+            if not captcha_info:
+                self.log("✓ No CAPTCHA detected on page", "DEBUG")
+                return
+            
+            # CAPTCHA detected
+            self.captcha_stats['detected'] += 1
+            self.log(f"⚠ CAPTCHA detected: {captcha_info['type']}")
+            self.take_screenshot(page_url, 'captcha_detected')
+            
+            # Try to solve
+            try:
+                self.log(f"→ Solving CAPTCHA (timeout: {self.captcha_solver.timeout}s)...")
+                token = self.captcha_solver.solve(captcha_info, proxy=self.proxy)
+                
+                if not token:
+                    self.captcha_stats['failed'] += 1
+                    self.log("✗ Failed to solve CAPTCHA", "ERROR")
+                    self.take_screenshot(page_url, 'captcha_failed')
+                    return
+                
+                # Inject token
+                self.log("→ Injecting CAPTCHA token into page...")
+                from captcha_solver import CaptchaTokenInjector
+                
+                injection_script = CaptchaTokenInjector.get_injection_script(
+                    token, 
+                    captcha_info['type'],
+                    page_url
+                )
+                
+                self.driver.execute_script(injection_script)
+                self.log("✓ CAPTCHA token injected")
+                self.captcha_stats['solved'] += 1
+                
+                # Take screenshot after injection
+                time.sleep(1)
+                self.take_screenshot(page_url, 'captcha_solved')
+                
+                # Wait a bit for page to process
+                time.sleep(2)
+                
+            except Exception as e:
+                self.captcha_stats['failed'] += 1
+                self.log(f"✗ Error solving CAPTCHA: {e}", "ERROR")
+                self.take_screenshot(page_url, 'captcha_error')
+        
+        except Exception as e:
+            self.log(f"✗ CAPTCHA handling error: {e}", "ERROR")
+    
     def take_screenshot(self, url, status='screenshot'):
         """Создание скриншота"""
         try:
@@ -2177,7 +2277,9 @@ class MultiThreadMailer:
                 proxy=proxy,
                 log_callback=log_callback,
                 incognito_mode=settings.get('incognito_mode', False),
-                session_ttl=settings.get('session_ttl', 0)
+                session_ttl=settings.get('session_ttl', 0),
+                enable_captcha_solving=settings.get('enable_captcha_solving', False),
+                captcha_api_key=settings.get('captcha_api_key', None)
             )
 
             while not self.stop_event.is_set():
@@ -2273,6 +2375,12 @@ class MailingManager:
     def save_report(self, session_folder, results, selector_monitor=None):
         """Сохранить отчет о рассылке (JSON + TXT)"""
 
+        # Aggregate CAPTCHA statistics
+        total_captcha_detected = sum(r.get('captcha_stats', {}).get('detected', 0) for r in results)
+        total_captcha_solved = sum(r.get('captcha_stats', {}).get('solved', 0) for r in results)
+        total_captcha_failed = sum(r.get('captcha_stats', {}).get('failed', 0) for r in results)
+        total_captcha_skipped = sum(r.get('captcha_stats', {}).get('skipped', 0) for r in results)
+
         # JSON отчет
         report_json = os.path.join(session_folder, 'report.json')
         summary = {
@@ -2280,27 +2388,46 @@ class MailingManager:
             'total': len(results),
             'success': len([r for r in results if r['status'] == 'success']),
             'failed': len([r for r in results if r['status'] == 'error']),
+            'captcha': {
+                'detected': total_captcha_detected,
+                'solved': total_captcha_solved,
+                'failed': total_captcha_failed,
+                'skipped': total_captcha_skipped
+            },
             'results': results
         }
-        
+
         with open(report_json, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=4, ensure_ascii=False)
-            
+
         # TXT отчет
         report_txt = os.path.join(session_folder, 'report.txt')
         with open(report_txt, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("ОТЧЕТ О РАССЫЛКЕ (v2.1 ИСПРАВЛЕННАЯ)\n")
+            f.write("ОТЧЕТ О РАССЫЛКЕ (v2.1 ИСПРАВЛЕННАЯ + CAPTCHA)\n")
             f.write("="*70 + "\n\n")
             f.write(f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Всего сайтов: {summary['total']}\n")
             f.write(f"Успешно отправлено: {summary['success']}\n")
             f.write(f"Ошибок: {summary['failed']}\n")
             f.write(f"Успешность: {round(summary['success']/summary['total']*100, 1) if summary['total'] > 0 else 0}%\n\n")
+
+            # CAPTCHA statistics
+            f.write("="*70 + "\n")
+            f.write("CAPTCHA СТАТИСТИКА:\n")
+            f.write("="*70 + "\n")
+            f.write(f"CAPTCHA обнаружено: {total_captcha_detected}\n")
+            f.write(f"CAPTCHA решено: {total_captcha_solved}\n")
+            f.write(f"Не удалось решить: {total_captcha_failed}\n")
+            f.write(f"Пропущено: {total_captcha_skipped}\n")
+            if total_captcha_detected > 0:
+                f.write(f"Успешность решения: {round(total_captcha_solved/total_captcha_detected*100, 1)}%\n")
+            f.write("\n")
+
             f.write("="*70 + "\n")
             f.write("ДЕТАЛИ:\n")
             f.write("="*70 + "\n\n")
-            
+
             for i, r in enumerate(results, 1):
                 f.write(f"{i}. {r['url']}\n")
                 f.write(f"   Поток: Thread-{r.get('thread_id', '?')}\n")
@@ -2309,11 +2436,20 @@ class MailingManager:
                     f.write(f"   Тип чата: {r['chat_type'].upper()}\n")
                 if r.get('error'):
                     f.write(f"   Ошибка: {r['error']}\n")
+
+                # CAPTCHA stats per URL
+                captcha_stats = r.get('captcha_stats')
+                if captcha_stats:
+                    f.write(f"   CAPTCHA обнаружено: {captcha_stats.get('detected', 0)}\n")
+                    f.write(f"   CAPTCHA решено: {captcha_stats.get('solved', 0)}\n")
+                    if captcha_stats.get('failed', 0) > 0:
+                        f.write(f"   Не удалось решить: {captcha_stats.get('failed', 0)}\n")
+
                 f.write(f"   Время выполнения: {r.get('duration', 0)}с\n")
                 if r.get('screenshot'):
                     f.write(f"   Скриншот: {os.path.basename(r['screenshot'])}\n")
                 f.write("\n")
-        
+
         print(f"\n✓ Отчет сохранен: {report_txt}")
 
 # ============================================================================
@@ -2507,10 +2643,34 @@ class ChatBotGUI:
         ttk.Button(proxy_frame, text="📡 Загрузить прокси", 
                   command=self.load_proxies).pack(side=tk.LEFT)
         
-        self.proxy_count_label = ttk.Label(proxy_frame, text="Прокси: 0", 
+        self.proxy_count_label = ttk.Label(proxy_frame, text="Прокси: 0",
                                            font=('Arial', 8))
         self.proxy_count_label.pack(side=tk.LEFT, padx=(10, 0))
-        
+
+        # CAPTCHA Solving settings
+        ttk.Separator(col2, orient='horizontal').pack(fill=tk.X, pady=(15, 10))
+
+        ttk.Label(col2, text="🔐 CAPTCHA Solving", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+
+        self.enable_captcha_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(col2, text="🤖 Автоматически решать CAPTCHA",
+                       variable=self.enable_captcha_var,
+                       command=self.on_captcha_toggle).pack(anchor=tk.W, pady=2)
+
+        # 2Captcha API key input
+        api_key_frame = ttk.Frame(col2)
+        api_key_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(api_key_frame, text="2Captcha API Key:", font=('Arial', 9)).pack(anchor=tk.W)
+
+        self.captcha_api_key_var = tk.StringVar(value="")
+        api_key_entry = ttk.Entry(api_key_frame, textvariable=self.captcha_api_key_var,
+                                  width=40, show="*")
+        api_key_entry.pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Label(api_key_frame, text="Get key from: https://2captcha.com/api/user",
+                 font=('Arial', 7), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
+
         # ========== ВКЛАДКА 2: ПРОГРЕСС РАССЫЛКИ ==========
         progress_frame = ttk.Frame(notebook, padding=10)
         notebook.add(progress_frame, text="📊 Прогресс рассылки")
@@ -2805,13 +2965,22 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
             title="Выберите файл с прокси",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
         )
-        
+
         if filepath:
             self.proxy_manager = ProxyManager(filepath)
             count = len(self.proxy_manager.proxies)
             self.proxy_count_label.config(text=f"Прокси: {count}")
             messagebox.showinfo("Успех", f"Загружено {count} прокси\n\nФормат поддерживаемых прокси:\n- ip:port\n- ip:port:user:pass")
-    
+
+    def on_captcha_toggle(self):
+        """Toggle CAPTCHA solving"""
+        if self.enable_captcha_var.get():
+            api_key = self.captcha_api_key_var.get().strip()
+            if not api_key:
+                messagebox.showwarning("Внимание",
+                   "Пожалуйста, введите 2Captcha API ключ перед включением решения CAPTCHA")
+                self.enable_captcha_var.set(False)
+
     # ========== ФУНКЦИИ УПРАВЛЕНИЯ ЛОГАМИ ==========
     
     def clear_logs(self):
@@ -2952,6 +3121,11 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
         self.log_message(f"TTL сессии (мин/URL): {self.session_ttl_var.get()}")
         if self.proxy_manager:
             self.log_message(f"Прокси: {len(self.proxy_manager.proxies)} шт.")
+        if self.enable_captcha_var.get():
+            self.log_message(f"🤖 CAPTCHA решение: Включено")
+            api_key = self.captcha_api_key_var.get().strip()
+            if api_key:
+                self.log_message(f"   API ключ: {api_key[:10]}...{api_key[-5:]}")
 
         self.log_message("="*70)
 
@@ -2972,6 +3146,8 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
                 'incognito_mode': self.incognito_var.get(),
                 'session_ttl': self.session_ttl_var.get(),
                 'debug_logging': self.debug_logs_var.get(),
+                'enable_captcha_solving': self.enable_captcha_var.get(),
+                'captcha_api_key': self.captcha_api_key_var.get().strip() if self.enable_captcha_var.get() else None,
             }
 
             def progress_callback(completed, total):
