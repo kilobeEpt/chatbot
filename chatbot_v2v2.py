@@ -15,11 +15,13 @@ import glob
 import requests
 import zipfile
 import shutil
+import tempfile
 import pandas as pd
 import time
 import logging
 import random
 from pathlib import Path
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 
@@ -679,12 +681,13 @@ class ChatBot:
         }
     }
     
-    def __init__(self, session_folder, thread_id=0, headless=False, timeout=10, 
-                 fast_mode=True, use_antidetect=True, proxy=None, log_callback=None):
+    def __init__(self, session_folder, thread_id=0, headless=False, timeout=10,
+                 fast_mode=True, use_antidetect=True, proxy=None, log_callback=None,
+                 incognito_mode=False, session_ttl=0):
         """
         Инициализация бота
         """
-        
+
         self.thread_id = thread_id
         self.timeout = timeout
         self.session_folder = session_folder
@@ -696,11 +699,19 @@ class ChatBot:
         self.max_attempts = 3
         self.log_callback = log_callback
         self.proxy = proxy
-        
+
+        self.headless = headless
+        self.incognito_mode = bool(incognito_mode)
+        self.session_ttl = session_ttl
+        self.session_started_at = None
+        self.session_requests = 0
+        self.temp_user_data_dir = None
+        self.last_origin = None
+
         # Антидетект
         self.use_antidetect = use_antidetect
         self.antidetect = AntidetectManager(fast_mode) if use_antidetect else None
-        
+
         # ИСПРАВЛЕНО: Увеличены задержки для надежности
         if fast_mode:
             self.delay_page_load = 4  # было 3
@@ -714,14 +725,18 @@ class ChatBot:
             self.delay_before_send = 1.5  # было 1
             self.delay_after_send = 3  # было 2
             self.typing_delay = 0.03
-        
+
         os.makedirs(self.screenshots_folder, exist_ok=True)
-        
+
         self.setup_logging()
         self.driver = self._init_driver(headless)
-        
+        self.session_started_at = time.time()
+        self.session_requests = 0
+        self.last_origin = None
+        self.clear_browser_state(reason="startup")
+
     def log(self, message, level="INFO"):
-        """Логирование с указанием потока"""
+
         prefixed_message = f"[Thread-{self.thread_id}] {message}"
         
         if self.log_callback:
@@ -810,13 +825,23 @@ class ChatBot:
         self.log("Инициализация WebDriver с антидетектом...")
         
         options = Options()
-        
+
+        if self.incognito_mode:
+            self._cleanup_temp_user_data_dir()
+            self.temp_user_data_dir = tempfile.mkdtemp(prefix=f"chatbot_incognito_t{self.thread_id}_")
+            options.add_argument(f"--user-data-dir={self.temp_user_data_dir}")
+            options.add_argument('--incognito')
+            options.add_argument('--disable-application-cache')
+            options.add_argument('--aggressive-cache-discard')
+            self.log(f"Инкогнито: включен | Профиль: {self.temp_user_data_dir}")
+
         if headless:
             options.add_argument('--headless=new')
             # ИСПРАВЛЕНО: Отключаем GPU в headless для избежания ошибок
             options.add_argument('--disable-gpu')
             options.add_argument('--disable-software-rasterizer')
-        
+
+
         # Базовые настройки
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--disable-dev-shm-usage')
@@ -935,7 +960,137 @@ class ChatBot:
         
         self.log("✓ WebDriver запущен с антидетектом")
         return driver
-    
+
+    def _cleanup_temp_user_data_dir(self):
+        if not self.temp_user_data_dir:
+            return
+
+        dir_path = self.temp_user_data_dir
+        self.temp_user_data_dir = None
+
+        for _ in range(3):
+            try:
+                shutil.rmtree(dir_path, ignore_errors=False)
+                return
+            except Exception:
+                time.sleep(0.5)
+
+        try:
+            shutil.rmtree(dir_path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _get_origin_from_url(self, url):
+        try:
+            parsed = urlparse(url)
+            if not parsed.scheme or not parsed.netloc:
+                return None
+            return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            return None
+
+    def _parse_session_ttl(self):
+        ttl = self.session_ttl
+        minutes_ttl = None
+        max_urls = None
+
+        if isinstance(ttl, dict):
+            minutes_ttl = ttl.get('minutes')
+            max_urls = ttl.get('urls')
+        else:
+            try:
+                ttl_int = int(ttl)
+            except Exception:
+                ttl_int = 0
+
+            if ttl_int > 0:
+                minutes_ttl = ttl_int
+                max_urls = ttl_int
+
+        return minutes_ttl, max_urls
+
+    def clear_browser_state(self, reason=None, next_url=None):
+        if not self.driver:
+            return
+
+        origins_to_clear = set()
+        if self.last_origin:
+            origins_to_clear.add(self.last_origin)
+
+        if next_url:
+            next_origin = self._get_origin_from_url(next_url)
+            if next_origin:
+                origins_to_clear.add(next_origin)
+
+        log_level = "INFO" if self.incognito_mode else "DEBUG"
+        suffix = f" | {reason}" if reason else ""
+        self.log(f"🧹 Очистка cookies/cache/storage{suffix}", log_level)
+
+        try:
+            self.driver.execute_cdp_cmd('Network.clearBrowserCookies', {})
+        except Exception as e:
+            self.log(f"Network.clearBrowserCookies: {e}", "DEBUG")
+
+        try:
+            self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
+        except Exception as e:
+            self.log(f"Network.clearBrowserCache: {e}", "DEBUG")
+
+        for origin in origins_to_clear:
+            try:
+                self.driver.execute_cdp_cmd('Storage.clearDataForOrigin', {
+                    'origin': origin,
+                    'storageTypes': 'all'
+                })
+            except Exception as e:
+                self.log(f"Storage.clearDataForOrigin({origin}): {e}", "DEBUG")
+
+        try:
+            self.driver.delete_all_cookies()
+        except Exception as e:
+            self.log(f"delete_all_cookies: {e}", "DEBUG")
+
+    def ensure_session_alive(self):
+        try:
+            minutes_ttl, max_urls = self._parse_session_ttl()
+            if not minutes_ttl and not max_urls:
+                return
+
+            if self.session_started_at is None:
+                self.session_started_at = time.time()
+
+            now = time.time()
+            elapsed_sec = now - self.session_started_at
+
+            rotate_reason = None
+            if minutes_ttl and elapsed_sec >= minutes_ttl * 60:
+                rotate_reason = f"TTL по времени: {round(elapsed_sec / 60, 1)} мин >= {minutes_ttl} мин"
+            elif max_urls and self.session_requests >= max_urls:
+                rotate_reason = f"TTL по URL: {self.session_requests} >= {max_urls}"
+
+            if rotate_reason:
+                self.log(f"↻ Ротация браузер-сессии: {rotate_reason}")
+                self._restart_driver()
+        except Exception as e:
+            self.log(f"Ошибка контроля TTL: {e}", "DEBUG")
+
+    def _restart_driver(self):
+        try:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+        finally:
+            self.driver = None
+            self._cleanup_temp_user_data_dir()
+
+        self.driver = self._init_driver(self.headless)
+        self.session_started_at = time.time()
+        self.session_requests = 0
+        self.last_origin = None
+        self.clear_browser_state(reason="restart")
+
     # НОВЫЙ МЕТОД: Безопасное переключение в основной контекст
     def switch_to_default_content(self):
         """Безопасное переключение в основной контекст"""
@@ -946,7 +1101,7 @@ class ChatBot:
             self.log("✓ Переключено в основной контекст", "DEBUG")
         except Exception as e:
             self.log(f"Ошибка переключения в основной контекст: {e}", "DEBUG")
-    
+
     # НОВЫЙ МЕТОД: Безопасное переключение в iframe
     def switch_to_iframe(self, iframe):
         """Безопасное переключение в iframe"""
@@ -967,15 +1122,19 @@ class ChatBot:
         try:
             self.log(f"→ Открытие: {url}")
             
+            self.ensure_session_alive()
+            self.clear_browser_state(reason="before_open", next_url=url)
+            self.session_requests += 1
+
             # Сброс контекста
             self.switch_to_default_content()
-            
+
             # АНТИДЕТЕКТ: Случайная задержка перед открытием
             if self.use_antidetect:
                 self.antidetect.random_delay(0.5, 1.5)
-            
+
             self.driver.get(url)
-            
+
             # Ожидание загрузки
             time.sleep(self.delay_page_load)
             
@@ -984,9 +1143,10 @@ class ChatBot:
                 self.antidetect.random_scroll(self.driver)
                 self.antidetect.random_delay(1, 2)
             
+            self.last_origin = self._get_origin_from_url(self.driver.current_url)
             self.log("✓ Загружено")
             return True
-            
+
         except Exception as e:
             self.log(f"✗ Ошибка открытия: {e}", "ERROR")
             return False
@@ -1875,26 +2035,29 @@ class ChatBot:
     def take_screenshot(self, url, status='screenshot'):
         """Создание скриншота"""
         try:
-            from urllib.parse import urlparse
             domain = urlparse(url).netloc.replace('www.', '').replace('.', '_')
             timestamp = datetime.now().strftime('%H%M%S')
             filename = f"t{self.thread_id}_{domain}_{status}_{timestamp}.png"
             filepath = os.path.join(self.screenshots_folder, filename)
-            
+
             self.driver.save_screenshot(filepath)
             self.log(f"✓ Скриншот: {filename}", "DEBUG")
             return filepath
         except Exception as e:
             self.log(f"Ошибка скриншота: {e}", "ERROR")
             return None
-        
+
     def close(self):
         """Закрытие браузера"""
         try:
-            self.driver.quit()
+            if self.driver:
+                self.driver.quit()
             self.log("✓ Браузер закрыт")
-        except:
-            pass
+        except Exception as e:
+            self.log(f"Ошибка закрытия браузера: {e}", "DEBUG")
+        finally:
+            self.driver = None
+            self._cleanup_temp_user_data_dir()
 
 
 # ============================================================================
@@ -1920,96 +2083,77 @@ class MultiThreadMailer:
         self.stop_event = threading.Event()
     
     def run_parallel_mailing(self, urls, message, settings, log_callback=None, progress_callback=None):
-        """
-        Параллельная обработка списка URL
-        
-        Args:
-            urls: Список URL
-            message: Сообщение для отправки
-            settings: Настройки (session_folder, headless, fast_mode)
-            log_callback: Функция для логирования
-            progress_callback: Функция для обновления прогресса
-            
-        Returns:
-            list: Список результатов
-        """
-        
-        session_folder = settings['session_folder']
+        """Параллельная обработка списка URL"""
+
         results = []
-        completed = 0
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
-            
-            # Создаем задачи для каждого URL
-            for i, url in enumerate(urls):
+        total = len(urls)
+        if total == 0:
+            return results
+
+        url_queue = queue.Queue()
+        for url in urls:
+            url_queue.put(url)
+
+        results_queue = queue.Queue()
+
+        worker_count = min(self.max_workers, total)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = []
+
+            for worker_id in range(worker_count):
                 if self.stop_event.is_set():
                     break
-                
-                # Получаем прокси для потока (если есть)
+
                 proxy = None
                 if self.proxy_manager and self.proxy_manager.proxies:
                     proxy = self.proxy_manager.get_next_proxy()
-                
-                # Создаем задачу
-                future = executor.submit(
-                    self.process_single_url,
-                    url, message, settings, i, proxy, log_callback
+
+                futures.append(
+                    executor.submit(
+                        self._worker_loop,
+                        worker_id,
+                        url_queue,
+                        results_queue,
+                        message,
+                        settings,
+                        proxy,
+                        log_callback
+                    )
                 )
-                
-                futures[future] = {'url': url, 'index': i}
-            
-            # Собираем результаты по мере выполнения
-            for future in as_completed(futures):
-                if self.stop_event.is_set():
+
+            completed = 0
+
+            while completed < total:
+                if self.stop_event.is_set() and results_queue.empty():
                     break
-                
-                url_data = futures[future]
-                
+
                 try:
-                    result = future.result(timeout=120)  # Таймаут 2 минуты на один URL
-                    results.append(result)
-                    
-                    completed += 1
-                    
-                    # Обновляем прогресс
-                    if progress_callback:
-                        progress_callback(completed, len(urls))
-                    
+                    result = results_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if all(f.done() for f in futures) and url_queue.empty():
+                        break
+                    continue
+
+                results.append(result)
+                completed += 1
+
+                if progress_callback:
+                    progress_callback(completed, total)
+
+            for f in futures:
+                try:
+                    f.result(timeout=5)
                 except Exception as e:
-                    # Ошибка выполнения задачи
-                    results.append({
-                        'url': url_data['url'],
-                        'status': 'error',
-                        'error': f'Thread execution error: {str(e)}',
-                        'thread_id': url_data['index']
-                    })
-                    
                     if log_callback:
-                        log_callback(f"[Thread-{url_data['index']}] КРИТИЧЕСКАЯ ОШИБКА: {e}", "ERROR")
-        
+                        log_callback(f"[Thread-?] Ошибка worker: {e}", "ERROR")
+
         return results
-    
-    def process_single_url(self, url, message, settings, thread_id, proxy, log_callback):
-        """
-        Обработка одного URL в отдельном потоке
-        
-        Args:
-            url: URL сайта
-            message: Сообщение
-            settings: Настройки
-            thread_id: ID потока
-            proxy: Прокси
-            log_callback: Функция логирования
-            
-        Returns:
-            dict: Результат обработки
-        """
-        
+
+    def _worker_loop(self, thread_id, url_queue, results_queue, message, settings, proxy, log_callback):
         bot = None
-        
+
         try:
-            # Создаем отдельный экземпляр бота для потока
             bot = ChatBot(
                 session_folder=settings['session_folder'],
                 thread_id=thread_id,
@@ -2018,27 +2162,42 @@ class MultiThreadMailer:
                 fast_mode=settings.get('fast_mode', True),
                 use_antidetect=self.use_antidetect,
                 proxy=proxy,
-                log_callback=log_callback
+                log_callback=log_callback,
+                incognito_mode=settings.get('incognito_mode', False),
+                session_ttl=settings.get('session_ttl', 0)
             )
-            
-            # Отправляем сообщение
-            result = bot.send_message(url, message)
-            
-            return result
-            
-        except Exception as e:
-            return {
-                'url': url,
-                'status': 'error',
-                'error': str(e),
-                'thread_id': thread_id,
-                'duration': 0
-            }
+
+            while not self.stop_event.is_set():
+                try:
+                    url = url_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    result = bot.send_message(url, message)
+                except Exception as e:
+                    if log_callback:
+                        log_callback(f"[Thread-{thread_id}] Ошибка обработки URL: {e}", "ERROR")
+
+                    result = {
+                        'url': url,
+                        'status': 'error',
+                        'error': str(e),
+                        'thread_id': thread_id,
+                        'duration': 0
+                    }
+
+                results_queue.put(result)
+
+                try:
+                    url_queue.task_done()
+                except Exception:
+                    pass
+
         finally:
-            # Закрываем браузер
             if bot:
                 bot.close()
-    
+
     def stop(self):
         """Остановка всех потоков"""
         self.stop_event.set()
@@ -2288,16 +2447,30 @@ class ChatBotGUI:
         self.fast_mode_var = tk.BooleanVar(value=True)
         self.headless_var = tk.BooleanVar(value=False)
         self.antidetect_var = tk.BooleanVar(value=True)
-        
-        ttk.Checkbutton(col1, text="⚡ Быстрый режим", 
+        self.incognito_var = tk.BooleanVar(value=True)
+        self.session_ttl_var = tk.IntVar(value=15)
+
+        ttk.Checkbutton(col1, text="⚡ Быстрый режим",
                        variable=self.fast_mode_var).pack(anchor=tk.W, pady=2)
-        ttk.Checkbutton(col1, text="🔇 Фоновый режим (без GUI браузера)", 
+        ttk.Checkbutton(col1, text="🔇 Фоновый режим (без GUI браузера)",
                        variable=self.headless_var).pack(anchor=tk.W, pady=2)
-        ttk.Checkbutton(col1, text="🛡️ Антидетект (рекомендуется)", 
+        ttk.Checkbutton(col1, text="🛡️ Антидетект (рекомендуется)",
                        variable=self.antidetect_var).pack(anchor=tk.W, pady=2)
-        
+        ttk.Checkbutton(col1, text="🕶️ Инкогнито режим",
+                       variable=self.incognito_var).pack(anchor=tk.W, pady=(8, 2))
+
+        ttl_frame = ttk.Frame(col1)
+        ttl_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(ttl_frame, text="TTL сессии (мин/URL):").pack(side=tk.LEFT)
+        ttl_spinbox = ttk.Spinbox(ttl_frame, from_=0, to=999,
+                                  textvariable=self.session_ttl_var, width=6)
+        ttl_spinbox.pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Label(ttl_frame, text="0 = без перезапуска",
+                 font=('Arial', 8), foreground='gray').pack(side=tk.LEFT)
+
         # Колонка 2: Потоки и прокси
-        ttk.Label(col2, text="Количество потоков (1-10):").pack(anchor=tk.W)
+
         
         self.threads_var = tk.IntVar(value=3)
         threads_frame = ttk.Frame(col2)
@@ -2708,6 +2881,8 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
 • Быстрый режим: {'Да' if self.fast_mode_var.get() else 'Нет'}
 • Антидетект: {'Да' if self.antidetect_var.get() else 'Нет'}
 • Фоновый режим: {'Да' if self.headless_var.get() else 'Нет'}
+• Инкогнито режим: {'Да' if self.incognito_var.get() else 'Нет'}
+• TTL сессии (мин/URL): {self.session_ttl_var.get()}
 • Прокси: {len(self.proxy_manager.proxies) if self.proxy_manager else 0}
 
 ВНИМАНИЕ: В фоновом режиме GPU будет отключен автоматически.
@@ -2756,10 +2931,13 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
         self.log_message(f"Быстрый режим: {'Включен' if self.fast_mode_var.get() else 'Выключен'}")
         self.log_message(f"Антидетект: {'Включен' if self.antidetect_var.get() else 'Выключен'}")
         self.log_message(f"Фоновый режим: {'Включен (GPU отключен)' if self.headless_var.get() else 'Выключен'}")
+        self.log_message(f"Инкогнито режим: {'Включен' if self.incognito_var.get() else 'Выключен'}")
+        self.log_message(f"TTL сессии (мин/URL): {self.session_ttl_var.get()}")
         if self.proxy_manager:
             self.log_message(f"Прокси: {len(self.proxy_manager.proxies)} шт.")
+
         self.log_message("="*70)
-        
+
         results = []
         
         try:
@@ -2774,8 +2952,10 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
                 'session_folder': session_folder,
                 'headless': self.headless_var.get(),
                 'fast_mode': self.fast_mode_var.get(),
+                'incognito_mode': self.incognito_var.get(),
+                'session_ttl': self.session_ttl_var.get(),
             }
-            
+
             def progress_callback(completed, total):
                 """Обновление прогресса"""
                 progress = (completed / total) * 100
