@@ -24,6 +24,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+from contextlib import contextmanager
 
 from chat_selectors import CHAT_SELECTORS as CHAT_SELECTORS_DATASET, CHAT_SELECTORS_META as CHAT_SELECTORS_META_DATASET
 
