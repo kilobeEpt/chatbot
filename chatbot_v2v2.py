@@ -798,13 +798,18 @@ class ChatBot:
         elif level == "DEBUG":
             self.logger.debug(prefixed_message)
     
-    def setup_logging(self):
+    def setup_logging(self, debug=False):
         """Настройка логирования в файл"""
         log_file = os.path.join(self.session_folder, f'thread_{self.thread_id}.log')
         self.logger = logging.getLogger(f'ChatBot_{self.thread_id}_{id(self)}')
-        self.logger.setLevel(logging.INFO)
+
+        if debug:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
+
         self.logger.handlers.clear()
-        
+
         handler = logging.FileHandler(log_file, encoding='utf-8')
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         self.logger.addHandler(handler)
