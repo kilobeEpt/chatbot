@@ -2185,6 +2185,52 @@ class ChatBot:
 ChatBot.CHAT_SELECTORS = CHAT_SELECTORS_DATASET
 ChatBot.CHAT_SELECTORS_META = CHAT_SELECTORS_META_DATASET
 
+
+class SelectorMonitor:
+    """Отслеживает успехи/неудачи селекторов при детектировании форм и чатов"""
+
+    def __init__(self, dataset_meta=None):
+        self.dataset_meta = dataset_meta or {}
+        self.success_counts = {}  # {selector: count}
+        self.failure_counts = {}  # {selector: count}
+        self._lock = threading.Lock()
+
+    def _key(self, selector):
+        if isinstance(selector, dict):
+            if 'value' in selector:
+                return str(selector['value'])
+            try:
+                return json.dumps(selector, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(selector)
+        return str(selector)
+
+    def record_success(self, selector):
+        """Зафиксировать успешное использование селектора"""
+        key = self._key(selector)
+        with self._lock:
+            self.success_counts[key] = self.success_counts.get(key, 0) + 1
+
+    def record_failure(self, selector):
+        """Зафиксировать неудачное использование селектора"""
+        key = self._key(selector)
+        with self._lock:
+            self.failure_counts[key] = self.failure_counts.get(key, 0) + 1
+
+    def get_stats(self):
+        """Получить статистику по селекторам"""
+        with self._lock:
+            return {
+                'success_counts': dict(self.success_counts),
+                'failure_counts': dict(self.failure_counts),
+            }
+
+
+class FormDetector:
+    def __init__(self, bot):
+        self.bot = bot
+
+
 # ============================================================================
 # МУЛЬТИПОТОЧНАЯ РАССЫЛКА
 # ============================================================================
@@ -2291,8 +2337,12 @@ class MultiThreadMailer:
                 log_callback=log_callback,
                 incognito_mode=settings.get('incognito_mode', False),
                 session_ttl=settings.get('session_ttl', 0),
+                debug_logging=settings.get('debug_logging', False),
+                selector_monitor=self.selector_monitor,
                 enable_captcha_solving=settings.get('enable_captcha_solving', False),
-                captcha_api_key=settings.get('captcha_api_key', None)
+                captcha_api_key=settings.get('captcha_api_key', None),
+                cloudflare_bypass=settings.get('cloudflare_bypass', False),
+                cloudflare_timeout=settings.get('cloudflare_timeout', 30),
             )
 
             while not self.stop_event.is_set():
@@ -2399,6 +2449,8 @@ class MailingManager:
         cf_timeout = len([r for r in results if r.get('cloudflare_status') == 'timeout'])
         cf_not_detected = len([r for r in results if r.get('cloudflare_status') == 'not_detected'])
 
+        selector_stats = selector_monitor.get_stats() if selector_monitor else None
+
         # JSON отчет
         report_json = os.path.join(session_folder, 'report.json')
         summary = {
@@ -2417,6 +2469,7 @@ class MailingManager:
                 'timeout': cf_timeout,
                 'not_detected': cf_not_detected
             },
+            'selector_monitor': selector_stats,
             'results': results
         }
 
@@ -2458,6 +2511,20 @@ class MailingManager:
                 if cf_bypassed + cf_timeout > 0:
                     success_rate = round(cf_bypassed / (cf_bypassed + cf_timeout) * 100, 1)
                     f.write(f"Успешность обхода: {success_rate}%\n")
+                f.write("\n")
+
+            if selector_stats:
+                f.write("="*70 + "\n")
+                f.write("СТАТИСТИКА СЕЛЕКТОРОВ:\n")
+                f.write("="*70 + "\n")
+                success_counts = selector_stats.get('success_counts', {})
+                failure_counts = selector_stats.get('failure_counts', {})
+                f.write(f"Успешных срабатываний: {sum(success_counts.values())}\n")
+                f.write(f"Неудачных срабатываний: {sum(failure_counts.values())}\n")
+                if failure_counts:
+                    f.write("\nТоп проблемных селекторов:\n")
+                    for sel, cnt in sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+                        f.write(f"  - {sel}: {cnt}\n")
                 f.write("\n")
 
             f.write("="*70 + "\n")
@@ -3241,7 +3308,8 @@ ChatBot v2.1 - ИСПРАВЛЕННАЯ ВЕРСИЯ
             self.log_message(traceback.format_exc(), "ERROR")
         finally:
             # Сохранение отчета
-            self.manager.save_report(session_folder, results)
+            selector_monitor = getattr(self.multi_mailer, 'selector_monitor', None)
+            self.manager.save_report(session_folder, results, selector_monitor=selector_monitor)
             
             # Финальная статистика
             success_count = len([r for r in results if r['status'] == 'success'])
